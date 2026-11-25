@@ -3,6 +3,7 @@ package com.replayapp
 import android.app.*
 import android.content.ContentValues
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -45,6 +46,14 @@ class RecorderService : Service() {
     private val frames = ArrayDeque<Frame>()
     @Volatile private var format: MediaFormat? = null
     private var running = false
+
+    private val audioFrames = ArrayDeque<Frame>()
+    @Volatile private var audioFormat: MediaFormat? = null
+    @Volatile private var videoOffsetUs = Long.MIN_VALUE
+    @Volatile private var audioRunning = false
+    private var audioRecord: AudioRecord? = null
+    private var audioCodec: MediaCodec? = null
+    private var audioThread: Thread? = null
 
     private var bubble: TextView? = null
     private var bubbleLp: WindowManager.LayoutParams? = null
@@ -108,6 +117,8 @@ class RecorderService : Service() {
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
 
+        videoOffsetUs = Long.MIN_VALUE
+
         val c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         val t = HandlerThread("encoder")
         t.start()
@@ -120,6 +131,9 @@ class RecorderService : Service() {
                 val buf = codec.getOutputBuffer(index)
                 val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                 if (buf != null && info.size > 0 && !isConfig) {
+                    if (videoOffsetUs == Long.MIN_VALUE) {
+                        videoOffsetUs = System.nanoTime() / 1000 - info.presentationTimeUs
+                    }
                     val bytes = ByteArray(info.size)
                     buf.position(info.offset)
                     buf.limit(info.offset + info.size)
@@ -146,8 +160,133 @@ class RecorderService : Service() {
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             surface, null, null
         )
+
+        startAudio(proj)
+
         running = true
         showBubble()
+    }
+
+    private fun startAudio(proj: MediaProjection) {
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            toast("Sin permiso de audio: se grabará solo video")
+            return
+        }
+        try {
+            val rate = 44100
+            val config = AudioPlaybackCaptureConfiguration.Builder(proj)
+                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                .build()
+            val af = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(rate)
+                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                .build()
+            val minBuf = AudioRecord.getMinBufferSize(
+                rate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT
+            )
+            val rec = AudioRecord.Builder()
+                .setAudioFormat(af)
+                .setAudioPlaybackCaptureConfig(config)
+                .setBufferSizeInBytes(maxOf(minBuf, 16384) * 2)
+                .build()
+
+            val aFmt = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, rate, 2).apply {
+                setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+            }
+            val ac = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+            ac.configure(aFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            ac.start()
+            rec.startRecording()
+
+            audioRecord = rec
+            audioCodec = ac
+            audioRunning = true
+            val th = Thread { audioLoop(rec, ac, rate) }
+            audioThread = th
+            th.start()
+        } catch (e: Exception) {
+            toast("No se pudo iniciar el audio: " + e.message)
+        }
+    }
+
+    private fun audioLoop(rec: AudioRecord, ac: MediaCodec, rate: Int) {
+        val pcm = ByteArray(4096)
+        val info = MediaCodec.BufferInfo()
+        var basePts = -1L
+        var totalSamples = 0L
+        try {
+            while (audioRunning) {
+                val n = rec.read(pcm, 0, pcm.size)
+                if (n <= 0) {
+                    Thread.sleep(10)
+                    continue
+                }
+                val off = videoOffsetUs
+                if (off == Long.MIN_VALUE) continue
+
+                if (basePts < 0) {
+                    val chunkUs = (n / 4) * 1_000_000L / rate
+                    basePts = System.nanoTime() / 1000 - off - chunkUs
+                }
+
+                var fed = 0
+                while (fed < n && audioRunning) {
+                    val inIdx = ac.dequeueInputBuffer(10_000)
+                    if (inIdx >= 0) {
+                        val ib = ac.getInputBuffer(inIdx)!!
+                        ib.clear()
+                        val len = minOf(n - fed, ib.remaining())
+                        ib.put(pcm, fed, len)
+                        val pts = basePts + totalSamples * 1_000_000L / rate
+                        ac.queueInputBuffer(inIdx, 0, len, pts, 0)
+                        totalSamples += (len / 4).toLong()
+                        fed += len
+                    }
+                    drainAudio(ac, info)
+                }
+                drainAudio(ac, info)
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun drainAudio(ac: MediaCodec, info: MediaCodec.BufferInfo) {
+        while (true) {
+            val idx = ac.dequeueOutputBuffer(info, 0)
+            if (idx >= 0) {
+                val buf = ac.getOutputBuffer(idx)
+                val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                if (buf != null && info.size > 0 && !isConfig) {
+                    val bytes = ByteArray(info.size)
+                    buf.position(info.offset)
+                    buf.limit(info.offset + info.size)
+                    buf.get(bytes)
+                    addAudioFrame(Frame(bytes, info.presentationTimeUs, info.flags))
+                }
+                ac.releaseOutputBuffer(idx, false)
+            } else if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                audioFormat = ac.outputFormat
+            } else {
+                break
+            }
+        }
+    }
+
+    private fun stopAudio() {
+        audioRunning = false
+        try { audioRecord?.stop() } catch (_: Exception) {}
+        try { audioThread?.join(500) } catch (_: Exception) {}
+        try { audioRecord?.release() } catch (_: Exception) {}
+        try { audioCodec?.stop() } catch (_: Exception) {}
+        try { audioCodec?.release() } catch (_: Exception) {}
+        audioRecord = null
+        audioCodec = null
+        audioThread = null
     }
 
     private fun showBubble() {
@@ -313,6 +452,15 @@ class RecorderService : Service() {
         }
     }
 
+    private fun addAudioFrame(f: Frame) {
+        synchronized(lock) {
+            audioFrames.addLast(f)
+            while (audioFrames.size > 1 && f.ptsUs - audioFrames.first().ptsUs > MAX_KEEP_US + 2_000_000L) {
+                audioFrames.removeFirst()
+            }
+        }
+    }
+
     private fun toast(msg: String) {
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show()
@@ -322,8 +470,13 @@ class RecorderService : Service() {
     private fun saveClip(secs: Int = 30) {
         val keepUs = secs * 1_000_000L
         val fmt = format
+        val aFmt = audioFormat
         val snapshot: List<Frame>
-        synchronized(lock) { snapshot = ArrayList(frames) }
+        val audioSnap: List<Frame>
+        synchronized(lock) {
+            snapshot = ArrayList(frames)
+            audioSnap = ArrayList(audioFrames)
+        }
         if (fmt == null || snapshot.isEmpty()) {
             toast("Aún no hay video grabado")
             return
@@ -341,6 +494,9 @@ class RecorderService : Service() {
                     return@Thread
                 }
 
+                val base = snapshot[start].ptsUs
+                val audioList = if (aFmt != null) audioSnap.filter { it.ptsUs >= base } else emptyList()
+
                 val values = ContentValues().apply {
                     put(MediaStore.Video.Media.DISPLAY_NAME, "replay_" + System.currentTimeMillis() + ".mp4")
                     put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -354,19 +510,36 @@ class RecorderService : Service() {
                 }
 
                 val muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-                val track = muxer.addTrack(fmt)
+                val videoTrack = muxer.addTrack(fmt)
+                val audioTrack = if (aFmt != null && audioList.isNotEmpty()) muxer.addTrack(aFmt) else -1
                 muxer.start()
-                val base = snapshot[start].ptsUs
+
                 val info = MediaCodec.BufferInfo()
-                for (i in start until snapshot.size) {
-                    val f = snapshot[i]
-                    info.set(0, f.data.size, f.ptsUs - base, f.flags)
-                    muxer.writeSampleData(track, ByteBuffer.wrap(f.data), info)
+                var vi = start
+                var ai = 0
+                while (vi < snapshot.size || ai < audioList.size) {
+                    val vPts = if (vi < snapshot.size) snapshot[vi].ptsUs else Long.MAX_VALUE
+                    val aPts = if (ai < audioList.size) audioList[ai].ptsUs else Long.MAX_VALUE
+                    if (vPts <= aPts) {
+                        val f = snapshot[vi]
+                        info.set(0, f.data.size, f.ptsUs - base, f.flags)
+                        muxer.writeSampleData(videoTrack, ByteBuffer.wrap(f.data), info)
+                        vi++
+                    } else {
+                        val f = audioList[ai]
+                        info.set(0, f.data.size, f.ptsUs - base, 0)
+                        muxer.writeSampleData(audioTrack, ByteBuffer.wrap(f.data), info)
+                        ai++
+                    }
                 }
                 muxer.stop()
                 muxer.release()
                 pfd.close()
-                toast("Guardado en Movies/Replay")
+                if (audioTrack >= 0) {
+                    toast("Guardado en Movies/Replay")
+                } else {
+                    toast("Guardado en Movies/Replay (sin audio)")
+                }
             } catch (e: Exception) {
                 toast("Error al guardar: " + e.message)
             }
@@ -378,6 +551,7 @@ class RecorderService : Service() {
         hideBubble()
         if (!running) return
         running = false
+        stopAudio()
         try { display?.release() } catch (_: Exception) {}
         try { codec?.stop() } catch (_: Exception) {}
         try { codec?.release() } catch (_: Exception) {}
@@ -386,7 +560,12 @@ class RecorderService : Service() {
         display = null
         codec = null
         projection = null
-        synchronized(lock) { frames.clear() }
+        synchronized(lock) {
+            frames.clear()
+            audioFrames.clear()
+        }
+        audioFormat = null
+        videoOffsetUs = Long.MIN_VALUE
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
