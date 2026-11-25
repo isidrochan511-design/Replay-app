@@ -114,9 +114,11 @@ class MainActivity : Activity() {
         layout.addView(makeButton("Acerca de", "#37474F", 48) { showAbout() })
         setContentView(layout)
 
+                val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= 33) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), reqNotif)
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
         }
+        requestPermissions(perms.toTypedArray(), reqNotif)
     }
 
     private fun startCapture() {
