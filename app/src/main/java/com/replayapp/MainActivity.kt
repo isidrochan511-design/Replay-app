@@ -2,6 +2,7 @@ package com.replayapp
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
@@ -22,9 +23,17 @@ class MainActivity : Activity() {
     private val reqCapture = 1
     private val reqNotif = 2
 
+    private val tiktokUrl = "https://www.tiktok.com/@nova_blasse_official"
+    private val youtubeUrl = "https://youtube.com/@novablasse4718"
+
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
-    private fun makeButton(label: String, color: String, action: () -> Unit): Button {
+    private fun makeButton(
+        label: String,
+        color: String,
+        heightDp: Int = 56,
+        action: () -> Unit
+    ): Button {
         return Button(this).apply {
             text = label
             textSize = 16f
@@ -35,10 +44,28 @@ class MainActivity : Activity() {
                 setColor(Color.parseColor(color))
             }
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(56)
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(heightDp)
             ).apply { topMargin = dp(14) }
             setOnClickListener { action() }
         }
+    }
+
+    private fun openUrl(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (e: Exception) {
+            Toast.makeText(this, "No se pudo abrir el enlace", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun showAbout() {
+        AlertDialog.Builder(this)
+            .setTitle("Acerca de")
+            .setMessage("Creado por NV Blasse\n\nSígueme en mis redes:")
+            .setPositiveButton("TikTok") { _, _ -> openUrl(tiktokUrl) }
+            .setNegativeButton("YouTube") { _, _ -> openUrl(youtubeUrl) }
+            .setNeutralButton("Cerrar", null)
+            .show()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -84,6 +111,7 @@ class MainActivity : Activity() {
         layout.addView(makeButton("Detener", "#C62828") {
             sendAction(RecorderService.ACTION_STOP)
         })
+        layout.addView(makeButton("Acerca de", "#37474F", 48) { showAbout() })
         setContentView(layout)
 
         if (Build.VERSION.SDK_INT >= 33) {
